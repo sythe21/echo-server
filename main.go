@@ -1,44 +1,95 @@
 package main
 
 import (
-	"bufio"
+	"context"
+	"flag"
+	"fmt"
 	"log"
-	"net"
-	"encoding/hex"
+	"net/http"
+	"os"
+	"os/signal"
+	"time"
+
+	"github.com/hashicorp/http-echo/version"
+)
+
+var (
+	listenFlag  = flag.String("listen", ":5678", "address and port to listen")
+	textFlag    = flag.String("text", "", "text to put on the webpage")
+	versionFlag = flag.Bool("version", false, "display version information")
+
+	// stdoutW and stderrW are for overriding in test.
+	stdoutW = os.Stdout
+	stderrW = os.Stderr
 )
 
 func main() {
-	log.Printf("echo-server listening on tcp port 8800") 
-	
-	ln, err := net.Listen("tcp", ":8800") 
-	if err != nil { 
-		log.Fatalf("listen error, err=%s", err) 
-	} 
-	
-	accepted := 0 
-	for { 
-			conn, err := ln.Accept() 
-			if err != nil { 
-				log.Fatalf("accept error, err=%s", err) 
-			} 
-			accepted++ 
-			go handleConnection(conn) 
-			log.Printf("connection accepted %d", accepted) 
-	} 
-} 
+	flag.Parse()
 
-func handleConnection(conn net.Conn) { 
-	bufr := bufio.NewReader(conn)
-	buf := make([]byte, 1024)
-	
-	for {
-		readBytes, err := bufr.Read(buf)
-		if err != nil {
-			log.Printf("handle connection error, err=%s", err)
-			conn.Close()
-			return
+	// Asking for the version?
+	if *versionFlag {
+		fmt.Fprintln(stderrW, version.HumanVersion)
+		os.Exit(0)
+	}
+
+	// Validation
+	if *textFlag == "" {
+		fmt.Fprintln(stderrW, "Missing -text option!")
+		os.Exit(127)
+	}
+
+	args := flag.Args()
+	if len(args) > 0 {
+		fmt.Fprintln(stderrW, "Too many arguments!")
+		os.Exit(127)
+	}
+
+	// Flag gets printed as a page
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", httpLog(stdoutW, withAppHeaders(httpEcho(*textFlag))))
+
+	// Health endpoint
+	mux.HandleFunc("/health", withAppHeaders(httpHealth()))
+
+	server := &http.Server{
+		Addr:    *listenFlag,
+		Handler: mux,
+	}
+	serverCh := make(chan struct{})
+	go func() {
+		log.Printf("[INFO] server is listening on %s\n", *listenFlag)
+		if err := server.ListenAndServe(); err != http.ErrServerClosed {
+			log.Fatalf("[ERR] server exited with: %s", err)
 		}
-		log.Printf("<->\n%s", hex.Dump(buf[:readBytes]))
-		conn.Write([]byte("CLOUDWALK "+string(buf[:readBytes])))
+		close(serverCh)
+	}()
+
+	signalCh := make(chan os.Signal, 1)
+	signal.Notify(signalCh, os.Interrupt)
+
+	// Wait for interrupt
+	<-signalCh
+
+	log.Printf("[INFO] received interrupt, shutting down...")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		log.Fatalf("[ERR] failed to shutdown server: %s", err)
+	}
+
+	// If we got this far, it was an interrupt, so don't exit cleanly
+	os.Exit(2)
+}
+
+func httpEcho(v string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, v)
+	}
+}
+
+func httpHealth() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, `{"status":"ok"}`)
 	}
 }
